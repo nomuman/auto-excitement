@@ -1,4 +1,4 @@
-# TRIBEv2 Viewer
+# Auto Excitement
 
 短い動画をブラウザにアップロードすると、Meta の `facebook/tribev2` モデルが
 fsaverage5 表面 (20484 頂点) の BOLD 反応を予測 → Yeo7 ネットワーク平均と
