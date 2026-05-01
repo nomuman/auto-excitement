@@ -1,0 +1,749 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>TRIBEv2 Viewer — fMRI 推定</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 1.5rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+  .lead { color: #666; font-size: 0.9rem; margin-bottom: 1rem; }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 800px) { .panels { grid-template-columns: 1fr; } }
+  video { width: 100%; background: #000; border-radius: 4px; }
+  .form { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  button { padding: 0.5rem 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { color: #555; font-size: 0.9rem; }
+  .progress { background: #eee; border-radius: 4px; height: 14px; margin: 0.4rem 0; overflow: hidden; }
+  .progress > div { height: 100%; background: linear-gradient(90deg,#3498db,#1abc9c); transition: width .3s; }
+  .phase { font-size: 0.8rem; color: #666; min-height: 1.1em; }
+  .scores { display: flex; gap: 0.5rem; margin: 0.6rem 0; flex-wrap: wrap; }
+  .score { flex: 1 1 22%; padding: 0.4rem 0.5rem; background: #f4f4f4; border-radius: 4px; min-width: 110px; }
+  .score small { display: block; color: #777; font-size: 0.7rem; }
+  .score b { font-size: 1.4rem; display: block; line-height: 1; }
+  .score.exc b { color: #d35400; }
+  .score.val b { color: #c0392b; }
+  .score.cog b { color: #6c3483; }
+  .score.nov b { color: #1e8449; }
+  canvas { background: #fff; }
+  details { margin-top: 1rem; color: #555; font-size: 0.85rem; }
+  .log { font-family: monospace; font-size: 0.75rem; color: #888; max-height: 6em; overflow: auto; background: #fafafa; padding: 0.3rem 0.5rem; border-radius: 3px; margin-top: 0.5rem; }
+  .filmstrip-wrap { margin-top: 1rem; }
+  .filmstrip-wrap h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; }
+  .filmstrip { display: flex; overflow-x: auto; gap: 2px; padding-bottom: 0.4rem; border: 1px solid #eee; border-radius: 4px; background: #fafafa; }
+  .filmstrip .cell { position: relative; flex: 0 0 auto; cursor: pointer; display: flex; flex-direction: column; }
+  .filmstrip .frame { display: block; height: 72px; opacity: 0.65; transition: opacity .15s, outline .15s; outline: 0 solid transparent; }
+  .filmstrip .brain { display: block; height: 64px; opacity: 0.85; }
+  .filmstrip .cell:hover .frame { opacity: 1; }
+  .filmstrip .cell.active .frame { opacity: 1; outline: 3px solid #d35400; outline-offset: -3px; }
+  .filmstrip .cell.active .brain { opacity: 1; }
+  .filmstrip .label { font-family: monospace; font-size: 0.65rem; text-align: center; color: #666; padding: 1px; background: rgba(255,255,255,0.85); position: absolute; top: 56px; left: 50%; transform: translateX(-50%); border-radius: 2px; pointer-events: none; }
+  .filmstrip .cell.active .label { background: #d35400; color: white; }
+  .scorebar { display: block; height: 4px; }
+  .timeline { display: none; margin-top: 1rem; border: 1px solid #eee; border-radius: 4px; padding: 0.4rem 0.5rem; background: #fff; }
+  .timeline.show { display: block; }
+  .timeline h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; }
+  .lane { position: relative; width: 100%; cursor: crosshair; user-select: none; }
+  .lane + .lane { margin-top: 4px; }
+  .lane canvas { display: block; width: 100%; }
+  .lane-label { position: absolute; top: 2px; left: 4px; font-size: 0.7rem; color: rgba(0,0,0,0.55); background: rgba(255,255,255,0.7); padding: 0 4px; border-radius: 2px; pointer-events: none; z-index: 2; }
+  .words-strip { position: relative; height: 28px; background: #fafafa; overflow: hidden; }
+  .words-strip .w { position: absolute; top: 6px; font-size: 0.72rem; color: #333; white-space: nowrap; transform: translateX(-50%); padding: 1px 2px; border-radius: 2px; transition: background .1s, color .1s; pointer-events: none; }
+  .words-strip .w.spoken { background: #d35400; color: white; }
+  .timeline-cursor { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(0,0,0,0.65); pointer-events: none; z-index: 3; }
+  .cut-overlay { position: absolute; top: 0; bottom: 0; background: rgba(40,40,40,0.55); pointer-events: none; z-index: 2; mix-blend-mode: multiply; }
+  .cut-tool { display: none; margin-top: 1rem; border: 1px solid #eee; border-radius: 4px; padding: 0.5rem 0.7rem; background: #fff; }
+  .cut-tool.show { display: block; }
+  .cut-tool h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .cut-tool input[type=range] { width: 200px; }
+  .cut-tool pre { background: #1e2530; color: #d6dde8; padding: 0.6rem; border-radius: 4px; font-size: 0.78rem; overflow-x: auto; line-height: 1.45; margin: 0.4rem 0; }
+  .cut-tool button { padding: 0.4rem 0.8rem; cursor: pointer; margin-right: 0.4rem; }
+  .cut-summary { font-size: 0.85rem; color: #555; margin: 0.2rem 0 0.4rem; }
+</style>
+</head>
+<body>
+<h1>TRIBEv2 — 動画から fMRI 反応を推定</h1>
+<p class="lead">facebook/tribev2 が短い動画（音声+映像+文字起こし）から、fsaverage5 表面 (20484 頂点) の BOLD を予測。Yeo7 ネットワークごとに平均し、時系列を表示します。</p>
+
+<div class="form">
+  <input type="file" id="file" accept="video/*">
+  <label style="font-size:0.85rem;color:#555;">言語
+    <select id="language" style="padding:0.3rem;">
+      <option value="english" selected>English</option>
+      <option value="japanese_translate">日本語 → 英訳して推論（推奨）</option>
+      <option value="japanese">日本語（そのまま, 予測精度低）</option>
+      <option value="french">Français</option>
+      <option value="spanish">Español</option>
+      <option value="dutch">Nederlands</option>
+      <option value="chinese">中文</option>
+    </select>
+  </label>
+  <button id="run">予測する</button>
+  <span class="status" id="status">待機中</span>
+</div>
+<p style="color:#888;font-size:0.78rem;margin:0 0 0.5rem;">
+  ※ TRIBEv2 の脳予測は英語ネイティブ刺激で学習されています。日本語等の非英語で文字起こしは出ますが、言語ネットワークの予測精度は低下します（視覚・聴覚は機能します）。
+</p>
+<div class="progress"><div id="bar" style="width:0%"></div></div>
+<div class="phase" id="phase"></div>
+<div class="log" id="log"></div>
+
+<div class="panels">
+  <div>
+    <video id="video" controls playsinline></video>
+    <div class="scores">
+      <div class="score exc"><small>Excitement<br>感覚×注意の関与</small><b id="excVal">—</b></div>
+      <div class="score val"><small>Valence<br>感情の質 (limbic)</small><b id="valVal">—</b></div>
+      <div class="score cog"><small>Cognitive Load<br>制御 (FPCN+DAN)</small><b id="cogVal">—</b></div>
+      <div class="score nov"><small>Novelty<br>予測誤差 (salience)</small><b id="novVal">—</b></div>
+    </div>
+  </div>
+  <div>
+    <canvas id="chart" height="280"></canvas>
+  </div>
+</div>
+
+<div class="timeline" id="timeline">
+  <h3>タイムライン <span style="font-weight:normal;color:#888;font-size:0.8rem">（クリックでシーク）</span></h3>
+  <div class="lane" id="waveLane">
+    <span class="lane-label">audio waveform</span>
+    <canvas id="waveCanvas" height="60"></canvas>
+    <div class="timeline-cursor" id="waveCursor"></div>
+  </div>
+  <div class="lane" id="wordsLane">
+    <span class="lane-label">transcript</span>
+    <div class="words-strip" id="wordsStrip"></div>
+    <div class="timeline-cursor" id="wordsCursor"></div>
+  </div>
+  <div class="lane" id="axesLane">
+    <span class="lane-label">brain state axes (z)</span>
+    <canvas id="axesCanvas" height="100"></canvas>
+    <div class="timeline-cursor" id="axesCursor"></div>
+  </div>
+  <div class="lane" id="pcaLane">
+    <span class="lane-label">latent space (PCA top-3)</span>
+    <canvas id="pcaCanvas" height="80"></canvas>
+    <div class="timeline-cursor" id="pcaCursor"></div>
+  </div>
+</div>
+
+<div class="cut-tool" id="cutTool">
+  <h3>退屈カット
+    <span style="font-weight:normal;color:#666;font-size:0.8rem;">— excitement &lt;</span>
+    <input type="range" id="cutThresh" min="-2" max="2" step="0.05" value="-0.3">
+    <span id="cutThreshVal" style="font-family:monospace;">-0.30</span>
+    <span style="font-weight:normal;color:#666;font-size:0.8rem;">をカット</span>
+    <span style="flex:1"></span>
+    <span style="font-weight:normal;color:#888;font-size:0.78rem;">最低継続秒数</span>
+    <input type="number" id="cutMinKeep" min="0" max="10" step="0.5" value="1.0" style="width:60px;">
+    <span style="font-weight:normal;color:#888;font-size:0.78rem;">s</span>
+  </h3>
+  <div class="cut-summary" id="cutSummary">—</div>
+  <pre id="ffmpegCmd">—</pre>
+  <button id="previewCut">▶ ブラウザでプレビュー再生</button>
+  <button id="copyFfmpeg">コマンドをコピー</button>
+  <button id="downloadFfmpeg">.sh をダウンロード</button>
+  <span style="color:#888;font-size:0.78rem;">※ 入力ファイル名はプレースホルダ <code>input.mp4</code>。実ファイル名に書き換えてから実行</span>
+</div>
+
+<div class="filmstrip-wrap" id="stripWrap" style="display:none">
+  <h3>シーン × 脳活動 タイムライン <span style="font-weight:normal;color:#888;font-size:0.8rem">（上=動画フレーム、下=fsaverage5 表面の予測活動 / クリックでシーク）</span></h3>
+  <div class="filmstrip" id="strip"></div>
+</div>
+
+<details>
+<summary>軸の定義（経験則プロキシ + 純データ駆動の latent 空間）</summary>
+<p>1次元の「興奮 ↔ 退屈」では脳状態を捉えきれないため、4 つの仮置き軸 + PCA 上位 3 成分を返します。軸の名前は事後解釈です:</p>
+<ul>
+  <li><b>Excitement</b> = (z(Visual+SomatoMotor+DorsalAttn+VentralAttn) − z(DefaultMode))/2 — 感覚・注意の関与</li>
+  <li><b>Valence</b> = z(Limbic) — 感情価のプロキシ（OFC/vmPFC を含む辺縁系）</li>
+  <li><b>Cognitive Load</b> = z(mean(FrontoParietal, DorsalAttn)) — 制御要求／作業記憶</li>
+  <li><b>Novelty</b> = z(VentralAttn − mean(全 Yeo7)) — Salience が baseline を超える量（≈予測誤差）</li>
+  <li><b>PC1–3</b> — 20484 頂点空間の PCA 上位 3 成分（軸の意味は post-hoc）。PCA の累積寄与は data.pca_var で取得</li>
+</ul>
+</details>
+
+<script>
+const fileInput = document.getElementById('file');
+const runBtn = document.getElementById('run');
+const statusEl = document.getElementById('status');
+const phaseEl = document.getElementById('phase');
+const logEl = document.getElementById('log');
+const barEl = document.getElementById('bar');
+const video = document.getElementById('video');
+const scoreEls = {
+  excitement: document.getElementById('excVal'),
+  valence: document.getElementById('valVal'),
+  cognitive_load: document.getElementById('cogVal'),
+  novelty: document.getElementById('novVal'),
+};
+let chart = null;
+let data = null;
+let evtSource = null;
+
+const colors = {
+  Visual:'#e74c3c', Somatomotor:'#3498db', DorsalAttn:'#2ecc71',
+  VentralAttn:'#9b59b6', Limbic:'#f1c40f', FrontoParietal:'#e67e22', Default:'#1abc9c',
+  excitement:'#d35400', valence:'#c0392b', cognitive_load:'#6c3483', novelty:'#1e8449',
+  pc1:'#444', pc2:'#888', pc3:'#bbb',
+};
+const AXIS_KEYS = ['excitement', 'valence', 'cognitive_load', 'novelty'];
+
+const PHASES = [
+  ["Upload",              0,  3],
+  ["Extract audio",       3,  5],
+  ["Extracting words",    5,  8],
+  ["Add context",         8,  9],
+  ["Computing word embeddings", 9, 10],
+  ["Loading weights",    10, 12],
+  ["Encoding video",     12, 60],
+  ["Building dataloader",60, 62],
+  ["Reducing",           62, 64],
+  ["Extracting thumbnails", 64, 68],
+  ["Decoding audio waveform", 68, 70],
+  ["Rendering brain",    70,100],
+];
+
+function setBarFromPhase(phase, pct) {
+  for (const [needle, lo, hi] of PHASES) {
+    if (phase.toLowerCase().includes(needle.toLowerCase())) {
+      const w = lo + (hi - lo) * (pct/100);
+      barEl.style.width = w.toFixed(1) + '%';
+      return;
+    }
+  }
+}
+
+function appendLog(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function uploadWithProgress(url, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.upload.onload = () => onProgress(1, 1, true);  // upload bytes done
+    xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.onabort = () => reject(new Error('aborted'));
+    xhr.send(formData);
+  });
+}
+
+runBtn.onclick = async () => {
+  const f = fileInput.files[0];
+  if (!f) { statusEl.textContent = 'ファイルを選んでください'; return; }
+  if (evtSource) evtSource.close();
+  runBtn.disabled = true;
+  logEl.innerHTML = '';
+  barEl.style.width = '0%';
+  phaseEl.textContent = '';
+  const sizeMB = (f.size/1e6).toFixed(1);
+  statusEl.textContent = `アップロード開始… (${sizeMB} MB)`;
+  const fd = new FormData();
+  fd.append('video', f);
+  fd.append('language', document.getElementById('language').value);
+  const t0 = Date.now();
+  let job_id, video_url;
+  let lastTick = Date.now(), lastLoaded = 0;
+  try {
+    const resp = await uploadWithProgress('/predict', fd, (loaded, total, done) => {
+      if (done) {
+        phaseEl.textContent = `アップロード完了 (${sizeMB} MB) — サーバ受領待ち…`;
+        setBarFromPhase('Upload', 100);
+        return;
+      }
+      const pct = total > 0 ? Math.round(100 * loaded / total) : 0;
+      const now = Date.now();
+      const dt = (now - lastTick) / 1000;
+      let speedTxt = '';
+      if (dt > 0.25) {
+        const mbps = ((loaded - lastLoaded) / 1e6) / dt;
+        speedTxt = ` @ ${mbps.toFixed(1)} MB/s`;
+        lastTick = now; lastLoaded = loaded;
+      }
+      phaseEl.textContent = `アップロード ${(loaded/1e6).toFixed(1)}/${(total/1e6).toFixed(1)} MB (${pct}%)${speedTxt}`;
+      setBarFromPhase('Upload', pct);
+      statusEl.textContent = `アップロード中…`;
+    });
+    if (resp.status >= 400) throw new Error(resp.body || `HTTP ${resp.status}`);
+    const obj = JSON.parse(resp.body);
+    job_id = obj.job_id; video_url = obj.video_url;
+    video.src = video_url;
+    statusEl.textContent = '推論中…';
+    phaseEl.textContent = '';
+  } catch (e) {
+    statusEl.textContent = 'アップロード失敗: ' + e.message;
+    runBtn.disabled = false;
+    return;
+  }
+
+  evtSource = new EventSource(`/events/${job_id}`);
+  evtSource.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'progress') {
+      phaseEl.textContent = `${m.phase} — ${m.percent}%`;
+      setBarFromPhase(m.phase, m.percent);
+    } else if (m.type === 'log') {
+      appendLog(m.message);
+    } else if (m.type === 'error') {
+      statusEl.textContent = 'エラー: ' + m.message;
+    }
+  };
+  evtSource.addEventListener('result', (ev) => {
+    data = JSON.parse(ev.data);
+    barEl.style.width = '100%';
+    phaseEl.textContent = '';
+    const dt = ((Date.now()-t0)/1000).toFixed(1);
+    statusEl.textContent = `完了 (${dt}s, セグメント ${data.n_segments}, TR ${data.tr.toFixed(2)}s)`;
+    drawChart();
+    renderFilmstrip();
+    renderTimeline();
+    evtSource.close();
+    runBtn.disabled = false;
+  });
+  evtSource.addEventListener('error', (ev) => {
+    if (ev.data) {
+      try { statusEl.textContent = 'エラー: ' + JSON.parse(ev.data).message; } catch {}
+    }
+    if (evtSource.readyState === EventSource.CLOSED) {
+      runBtn.disabled = false;
+    }
+  });
+};
+
+function drawChart() {
+  const ctx = document.getElementById('chart');
+  if (chart) chart.destroy();
+  const datasets = [];
+  for (const [name, vals] of Object.entries(data.networks)) {
+    datasets.push({
+      label: name,
+      data: data.times.map((t, i) => ({ x: t, y: vals[i] })),
+      borderColor: colors[name] || '#888', borderWidth: 1.2, pointRadius: 0, tension: 0.2, yAxisID: 'y',
+    });
+  }
+  AXIS_KEYS.forEach(k => {
+    if (!data.axes || !data.axes[k]) return;
+    datasets.push({
+      label: k,
+      data: data.times.map((t, i) => ({ x: t, y: data.axes[k][i] })),
+      borderColor: colors[k],
+      borderWidth: k === 'excitement' ? 2.6 : 1.8,
+      pointRadius: 0, tension: 0.2, yAxisID: 'y2', borderDash: [4,2],
+    });
+  });
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      animation: false, responsive: true, interaction: { mode: 'nearest', axis: 'x' },
+      scales: {
+        x: { type: 'linear', title: { display: true, text: '時間 (s)' } },
+        y: { position: 'left', title: { display: true, text: 'ネットワーク平均 (a.u.)' } },
+        y2:{ position: 'right', title: { display: true, text: 'スコア (z)' }, grid: { display: false } },
+      },
+      plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 10 } } } },
+    },
+    plugins: [cursorPlugin],
+  });
+}
+
+function videoDuration() {
+  if (video.duration && isFinite(video.duration)) return video.duration;
+  if (data && data.times.length) return data.times[data.times.length-1] + (data.tr || 1);
+  return 1;
+}
+
+function renderTimeline() {
+  const tl = document.getElementById('timeline');
+  if (!data) { tl.classList.remove('show'); return; }
+  tl.classList.add('show');
+  document.getElementById('cutTool').classList.add('show');
+  // wait one frame so layout sees the new display:block before canvases measure clientWidth
+  requestAnimationFrame(() => {
+    drawWaveCanvas();
+    drawAxesCanvas();
+    drawPcaCanvas();
+    renderWordsStrip();
+    updateCutPreview();
+  });
+  // wire click-to-seek on each lane
+  ['waveLane', 'wordsLane', 'axesLane', 'pcaLane'].forEach(id => {
+    const el = document.getElementById(id);
+    el.onclick = (e) => {
+      const r = el.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width;
+      video.currentTime = Math.max(0, Math.min(videoDuration(), x * videoDuration()));
+      video.play().catch(()=>{});
+    };
+  });
+}
+
+function fitCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.parentElement.clientWidth;
+  const h = c.height;
+  c.width = Math.max(1, Math.floor(w * dpr));
+  c.style.width = w + 'px';
+  c.style.height = h + 'px';
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function drawWaveCanvas() {
+  const c = document.getElementById('waveCanvas');
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0, 0, w, h);
+  const wave = data.waveform || [];
+  if (!wave.length) return;
+  const mid = h / 2;
+  ctx.fillStyle = '#3498db';
+  for (let i = 0; i < wave.length; i++) {
+    const x = (i / wave.length) * w;
+    const x2 = ((i + 1) / wave.length) * w;
+    const amp = wave[i] * (h * 0.45);
+    ctx.fillRect(x, mid - amp, Math.max(1, x2 - x), amp * 2);
+  }
+}
+
+function _drawSeries(canvasId, series) {
+  // series: [{name, values, color, width?}]
+  const c = document.getElementById(canvasId);
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0, 0, w, h);
+  if (!series.length) return;
+  const dur = videoDuration();
+  let lo = Infinity, hi = -Infinity;
+  for (const s of series) for (const v of s.values) {
+    if (v < lo) lo = v; if (v > hi) hi = v;
+  }
+  if (!isFinite(lo)) return;
+  lo = Math.min(lo, -0.5); hi = Math.max(hi, 0.5);
+  const span = Math.max(1e-9, hi - lo);
+  const yOf = v => h - 6 - ((v - lo) / span) * (h - 12);
+  // zero baseline
+  ctx.strokeStyle = '#eee'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, yOf(0)); ctx.lineTo(w, yOf(0)); ctx.stroke();
+  // legend
+  ctx.font = '10px sans-serif'; ctx.textBaseline = 'top';
+  let lx = 60;
+  for (const s of series) {
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, 4, 10, 2);
+    ctx.fillText(s.name, lx + 14, 1);
+    lx += 14 + ctx.measureText(s.name).width + 12;
+  }
+  // lines
+  for (const s of series) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 1.6;
+    ctx.beginPath();
+    for (let i = 0; i < s.values.length; i++) {
+      const x = (data.times[i] / dur) * w;
+      const y = yOf(s.values[i]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawAxesCanvas() {
+  const ax = (data && data.axes) || {};
+  const series = AXIS_KEYS
+    .filter(k => Array.isArray(ax[k]))
+    .map(k => ({ name: k, values: ax[k], color: colors[k], width: k === 'excitement' ? 2.2 : 1.6 }));
+  _drawSeries('axesCanvas', series);
+}
+
+function drawPcaCanvas() {
+  const pca = (data && data.pca) || [];
+  const labels = pca.map((_, i) => `PC${i+1}` + (data.pca_var && data.pca_var[i] != null ? ` (${(data.pca_var[i]*100).toFixed(0)}%)` : ''));
+  const series = pca.map((vals, i) => ({
+    name: labels[i], values: vals,
+    color: [colors.pc1, colors.pc2, colors.pc3][i] || '#ccc',
+    width: 1.4,
+  }));
+  _drawSeries('pcaCanvas', series);
+}
+
+function renderWordsStrip() {
+  const strip = document.getElementById('wordsStrip');
+  strip.innerHTML = '';
+  const dur = videoDuration();
+  (data.words || []).forEach((w, i) => {
+    const s = document.createElement('span');
+    s.className = 'w'; s.dataset.idx = i;
+    s.dataset.start = w.t; s.dataset.end = w.t + Math.max(0.05, w.d);
+    s.style.left = ((w.t + w.d / 2) / dur * 100).toFixed(3) + '%';
+    s.textContent = w.text;
+    strip.appendChild(s);
+  });
+}
+
+function updateTimelineCursor() {
+  const dur = videoDuration();
+  const xPct = Math.max(0, Math.min(1, video.currentTime / dur)) * 100;
+  ['waveCursor', 'wordsCursor', 'axesCursor', 'pcaCursor'].forEach(id => {
+    document.getElementById(id).style.left = xPct.toFixed(3) + '%';
+  });
+  // highlight currently spoken word
+  const t = video.currentTime;
+  const ws = document.querySelectorAll('#wordsStrip .w');
+  for (const el of ws) {
+    const start = parseFloat(el.dataset.start);
+    const end = parseFloat(el.dataset.end);
+    el.classList.toggle('spoken', t >= start && t < end);
+  }
+}
+
+let _resizeT = null;
+window.addEventListener('resize', () => {
+  if (!data) return;
+  clearTimeout(_resizeT);
+  _resizeT = setTimeout(() => { drawWaveCanvas(); drawAxesCanvas(); drawPcaCanvas(); updateCutPreview(); }, 80);
+});
+
+function computeKeptIntervals(threshold, minKeepSec) {
+  const exc = (data.axes && data.axes.excitement) || [];
+  const tr = data.tr || 1;
+  const intervals = [];
+  let runStart = null;
+  for (let i = 0; i < exc.length; i++) {
+    const t = data.times[i];
+    if (exc[i] >= threshold) {
+      if (runStart === null) runStart = t;
+    } else if (runStart !== null) {
+      intervals.push([runStart, t]);
+      runStart = null;
+    }
+  }
+  if (runStart !== null) intervals.push([runStart, data.times[exc.length-1] + tr]);
+  return intervals.filter(([s,e]) => (e - s) >= (minKeepSec || 0));
+}
+
+function genFfmpeg(intervals, inputName, outputName) {
+  if (!intervals.length) {
+    return '# 全セグメントが閾値未満 — 残るものがありません。閾値を下げてください。\n';
+  }
+  const sel = intervals.map(([s,e]) => `between(t,${s.toFixed(2)},${e.toFixed(2)})`).join('+');
+  return `# excitement >= ${parseFloat(document.getElementById('cutThresh').value).toFixed(2)} の区間のみ残す
+ffmpeg -i "${inputName}" \\
+  -vf "select='${sel}',setpts=N/FRAME_RATE/TB" \\
+  -af "aselect='${sel}',asetpts=N/SR/TB" \\
+  -c:v libx264 -preset fast -crf 20 -c:a aac -b:a 192k \\
+  "${outputName}"
+`;
+}
+
+function paintCutOverlays(intervals) {
+  const dur = videoDuration();
+  // intervals are KEPT — invert to find DROPPED ranges
+  const dropped = [];
+  let cursor = 0;
+  for (const [s, e] of intervals) {
+    if (s > cursor) dropped.push([cursor, s]);
+    cursor = e;
+  }
+  if (cursor < dur) dropped.push([cursor, dur]);
+  ['waveLane', 'wordsLane', 'axesLane', 'pcaLane'].forEach(id => {
+    const lane = document.getElementById(id);
+    lane.querySelectorAll('.cut-overlay').forEach(el => el.remove());
+    for (const [s, e] of dropped) {
+      const ov = document.createElement('div');
+      ov.className = 'cut-overlay';
+      ov.style.left = (100 * s / dur).toFixed(3) + '%';
+      ov.style.width = (100 * (e - s) / dur).toFixed(3) + '%';
+      lane.appendChild(ov);
+    }
+  });
+  // also dim filmstrip cells that fall in dropped zones
+  const cells = document.querySelectorAll('#strip .cell');
+  cells.forEach(cell => {
+    const t = parseFloat(cell.dataset.t);
+    const inKept = intervals.some(([s,e]) => t >= s && t < e);
+    cell.style.opacity = inKept ? '' : '0.25';
+  });
+}
+
+function updateCutPreview() {
+  if (!data || !data.axes || !data.axes.excitement) return;
+  const thresh = parseFloat(document.getElementById('cutThresh').value);
+  const minKeep = parseFloat(document.getElementById('cutMinKeep').value) || 0;
+  document.getElementById('cutThreshVal').textContent = thresh.toFixed(2);
+  const intervals = computeKeptIntervals(thresh, minKeep);
+  const totalKept = intervals.reduce((a, [s,e]) => a + (e - s), 0);
+  const dur = videoDuration();
+  document.getElementById('cutSummary').innerHTML =
+    `${intervals.length} 区間 残る — 合計 <b>${totalKept.toFixed(1)}s</b> / ${dur.toFixed(1)}s ` +
+    `(${dur > 0 ? (100*totalKept/dur).toFixed(0) : 0}%)　削除 <b>${(dur-totalKept).toFixed(1)}s</b>`;
+  document.getElementById('ffmpegCmd').textContent = genFfmpeg(intervals, 'input.mp4', 'output_kept.mp4');
+  paintCutOverlays(intervals);
+}
+
+let _previewMode = false;
+let _previewIntervals = [];
+
+function _currentIntervals() {
+  const thresh = parseFloat(document.getElementById('cutThresh').value);
+  const minKeep = parseFloat(document.getElementById('cutMinKeep').value) || 0;
+  return computeKeptIntervals(thresh, minKeep);
+}
+
+function _enforcePreview() {
+  if (!_previewMode || !_previewIntervals.length) return;
+  const t = video.currentTime;
+  for (const [s, e] of _previewIntervals) {
+    if (t >= s && t < e) return;  // inside a kept interval
+  }
+  const next = _previewIntervals.find(([s]) => s > t);
+  if (next) {
+    video.currentTime = next[0];
+  } else {
+    video.currentTime = _previewIntervals[0][0];
+    if (!video.paused) video.pause();
+  }
+}
+
+video.addEventListener('timeupdate', _enforcePreview);
+video.addEventListener('seeking', _enforcePreview);
+
+function setPreviewMode(on) {
+  _previewMode = on;
+  const btn = document.getElementById('previewCut');
+  if (on) {
+    _previewIntervals = _currentIntervals();
+    if (!_previewIntervals.length) {
+      alert('残る区間がありません。閾値を下げてください。'); _previewMode = false; return;
+    }
+    btn.textContent = '■ 通常再生に戻す';
+    btn.style.background = '#d35400'; btn.style.color = 'white';
+    const t = video.currentTime;
+    if (!_previewIntervals.some(([s,e]) => t >= s && t < e)) {
+      video.currentTime = _previewIntervals[0][0];
+    }
+    video.play().catch(()=>{});
+  } else {
+    btn.textContent = '▶ ブラウザでプレビュー再生';
+    btn.style.background = ''; btn.style.color = '';
+  }
+}
+
+document.getElementById('previewCut').addEventListener('click', () => setPreviewMode(!_previewMode));
+document.getElementById('cutThresh').addEventListener('input', () => {
+  updateCutPreview();
+  if (_previewMode) _previewIntervals = _currentIntervals();
+});
+document.getElementById('cutMinKeep').addEventListener('input', () => {
+  updateCutPreview();
+  if (_previewMode) _previewIntervals = _currentIntervals();
+});
+document.getElementById('copyFfmpeg').addEventListener('click', async () => {
+  const text = document.getElementById('ffmpegCmd').textContent;
+  try { await navigator.clipboard.writeText(text); alert('コピーしました'); }
+  catch (e) { alert('コピー失敗: ' + e.message); }
+});
+document.getElementById('downloadFfmpeg').addEventListener('click', () => {
+  const text = '#!/bin/bash\nset -e\n' + document.getElementById('ffmpegCmd').textContent;
+  const blob = new Blob([text], { type: 'text/x-sh' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'cut_boring.sh';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+});
+
+function renderFilmstrip() {
+  const strip = document.getElementById('strip');
+  const wrap = document.getElementById('stripWrap');
+  strip.innerHTML = '';
+  if (!data || !data.thumbs || data.thumbs.length === 0) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+  const exc = (data.axes && data.axes.excitement) || [];
+  const lo = Math.min(...exc), hi = Math.max(...exc);
+  const span = Math.max(1e-9, hi - lo);
+  const brains = data.brain_urls || [];
+  data.thumbs.forEach((th, i) => {
+    const cell = document.createElement('div');
+    cell.className = 'cell'; cell.dataset.idx = i; cell.dataset.t = th.t;
+    const v = (data.axes && data.axes.valence    && data.axes.valence[i]) || 0;
+    const cog = (data.axes && data.axes.cognitive_load && data.axes.cognitive_load[i]) || 0;
+    const nov = (data.axes && data.axes.novelty   && data.axes.novelty[i]) || 0;
+    cell.title = `t=${th.t.toFixed(1)}s  exc=${exc[i].toFixed(2)}  val=${v.toFixed(2)}  cog=${cog.toFixed(2)}  nov=${nov.toFixed(2)}`;
+    cell.onclick = () => { video.currentTime = th.t; video.play().catch(()=>{}); };
+
+    const frame = new Image();
+    frame.src = th.url; frame.loading = 'lazy'; frame.className = 'frame';
+    cell.appendChild(frame);
+
+    const lbl = document.createElement('span'); lbl.className = 'label';
+    lbl.textContent = `${th.t.toFixed(0)}s ${exc[i] >= 0 ? '+' : ''}${exc[i].toFixed(2)}`;
+    cell.appendChild(lbl);
+
+    if (brains[i]) {
+      const brain = new Image();
+      brain.src = brains[i]; brain.loading = 'lazy'; brain.className = 'brain';
+      cell.appendChild(brain);
+    }
+
+    const bar = document.createElement('span'); bar.className = 'scorebar';
+    const norm = (exc[i] - lo) / span;
+    bar.style.background = `hsl(${(1-norm)*210}, 75%, 50%)`;
+    cell.appendChild(bar);
+
+    strip.appendChild(cell);
+  });
+}
+
+function updateFilmstripCursor(activeIdx) {
+  const cells = document.getElementById('strip').children;
+  for (let k = 0; k < cells.length; k++) {
+    cells[k].classList.toggle('active', k === activeIdx);
+  }
+  if (cells[activeIdx]) {
+    cells[activeIdx].scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+  }
+}
+
+const cursorPlugin = {
+  id: 'cursor',
+  afterDraw(c) {
+    if (!data) return;
+    const x = c.scales.x.getPixelForValue(video.currentTime);
+    const { top, bottom } = c.chartArea;
+    c.ctx.save();
+    c.ctx.strokeStyle = 'rgba(0,0,0,0.55)'; c.ctx.lineWidth = 1;
+    c.ctx.beginPath(); c.ctx.moveTo(x, top); c.ctx.lineTo(x, bottom); c.ctx.stroke();
+    c.ctx.restore();
+  }
+};
+
+let _lastIdx = -1;
+function tick() {
+  if (chart && data) {
+    chart.draw();
+    const t = video.currentTime;
+    let i = 0;
+    for (let k = 0; k < data.times.length; k++) {
+      if (data.times[k] <= t) i = k; else break;
+    }
+    AXIS_KEYS.forEach(k => {
+      const arr = data.axes && data.axes[k];
+      if (arr && arr[i] != null && scoreEls[k]) scoreEls[k].textContent = arr[i].toFixed(2);
+    });
+    updateTimelineCursor();
+    if (i !== _lastIdx) { updateFilmstripCursor(i); _lastIdx = i; }
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

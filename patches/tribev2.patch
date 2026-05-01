@@ -1,0 +1,165 @@
+diff --git a/tribev2/demo_utils.py b/tribev2/demo_utils.py
+index fa735a7..77df5d1 100644
+--- a/tribev2/demo_utils.py
++++ b/tribev2/demo_utils.py
+@@ -64,14 +64,23 @@ def download_file(url: str, path: str | Path) -> Path:
+ 
+ 
+ def get_audio_and_text_events(
+-    events: pd.DataFrame, audio_only: bool = False
++    events: pd.DataFrame, audio_only: bool = False, language: str = "english"
+ ) -> pd.DataFrame:
+     """Run the audio/video-to-text pipeline on an events DataFrame.
+ 
+     Extracts audio from video, chunks long clips, transcribes words, and
+     attaches sentence/context annotations.  Set *audio_only* to ``True``
+     to skip the transcription and text stages.
++
++    The pseudo-language ``"japanese_translate"`` runs WhisperX with
++    ``--task translate`` so Japanese audio yields English word events,
++    enabling downstream English-trained features.
+     """
++    if language == "japanese_translate":
++        whisper_lang, whisper_task = "japanese", "translate"
++    else:
++        whisper_lang, whisper_task = language, "transcribe"
++
+     transforms = [
+         ExtractAudioFromVideo(),
+         ChunkEvents(event_type_to_chunk="Audio", max_duration=60, min_duration=30),
+@@ -80,7 +89,7 @@ def get_audio_and_text_events(
+     if not audio_only:
+         transforms.extend(
+             [
+-                ExtractWordsFromAudio(),
++                ExtractWordsFromAudio(language=whisper_lang, task=whisper_task),
+                 AddText(),
+                 AddSentenceToWords(max_unmatched_ratio=0.05),
+                 AddContextToWords(
+@@ -245,6 +254,7 @@ class TribeModel(TribeExperiment):
+         text_path: str | None = None,
+         audio_path: str | None = None,
+         video_path: str | None = None,
++        language: str = "english",
+     ) -> pd.DataFrame:
+         """Build an events DataFrame from exactly one input source.
+ 
+@@ -317,7 +327,7 @@ class TribeModel(TribeExperiment):
+             "timeline": "default",
+             "subject": "default",
+         }
+-        return get_audio_and_text_events(pd.DataFrame([event]))
++        return get_audio_and_text_events(pd.DataFrame([event]), language=language)
+ 
+     def predict(
+         self, events: pd.DataFrame, verbose: bool = True
+diff --git a/tribev2/eventstransforms.py b/tribev2/eventstransforms.py
+index 1fd0c69..21edafa 100644
+--- a/tribev2/eventstransforms.py
++++ b/tribev2/eventstransforms.py
+@@ -89,17 +89,23 @@ class ExtractWordsFromAudio(EventsTransform):
+     """
+ 
+     language: str = "english"
++    task: str = "transcribe"  # or "translate" — Whisper's source-to-English translation
+     overwrite: bool = False
+ 
++    @property
++    def output_language(self) -> str:
++        return "english" if self.task == "translate" else self.language
++
+     @staticmethod
+-    def _get_transcript_from_audio(wav_filename: Path, language: str) -> pd.DataFrame:
++    def _get_transcript_from_audio(wav_filename: Path, language: str, task: str = "transcribe") -> pd.DataFrame:
+         import json
+         import os
+         import subprocess
+         import tempfile
+ 
+         language_codes = dict(
+-            english="en", french="fr", spanish="es", dutch="nl", chinese="zh"
++            english="en", french="fr", spanish="es", dutch="nl", chinese="zh",
++            japanese="ja",
+         )
+         if language not in language_codes:
+             raise ValueError(f"Language {language} not supported")
+@@ -117,14 +123,15 @@ class ExtractWordsFromAudio(EventsTransform):
+                 "large-v3",
+                 "--language",
+                 language_codes[language],
++                "--task",
++                task,
+                 "--device",
+                 device,
+                 "--compute_type",
+                 compute_type,
+                 "--batch_size",
+                 "16",
+-                "--align_model",
+-                "WAV2VEC2_ASR_LARGE_LV60K_960H" if language == "english" else "",
++                *(["--align_model", "WAV2VEC2_ASR_LARGE_LV60K_960H"] if (language == "english" and task == "transcribe") else []),
+                 "--output_dir",
+                 output_dir,
+                 "--output_format",
+@@ -143,17 +150,33 @@ class ExtractWordsFromAudio(EventsTransform):
+         for i, segment in enumerate(transcript["segments"]):
+             sentence = segment["text"]
+             sentence = sentence.replace('"', "")
+-            for word in segment["words"]:
+-                if "start" not in word:
++            seg_words = segment.get("words", []) or []
++            aligned = [w for w in seg_words if "start" in w and "end" in w]
++            if aligned:
++                for word in aligned:
++                    words.append({
++                        "text": word["word"].replace('"', ""),
++                        "start": word["start"],
++                        "duration": word["end"] - word["start"],
++                        "sequence_id": i,
++                        "sentence": sentence,
++                    })
++            else:
++                # Translate task (or any unaligned output): split sentence evenly across [start, end].
++                seg_start = float(segment.get("start", 0.0))
++                seg_end = float(segment.get("end", seg_start))
++                toks = [t for t in sentence.strip().split() if t]
++                if not toks or seg_end <= seg_start:
+                     continue
+-                word_dict = {
+-                    "text": word["word"].replace('"', ""),
+-                    "start": word["start"],
+-                    "duration": word["end"] - word["start"],
+-                    "sequence_id": i,
+-                    "sentence": sentence,
+-                }
+-                words.append(word_dict)
++                per = (seg_end - seg_start) / len(toks)
++                for k, tok in enumerate(toks):
++                    words.append({
++                        "text": tok.replace('"', ""),
++                        "start": seg_start + k * per,
++                        "duration": per,
++                        "sequence_id": i,
++                        "sentence": sentence,
++                    })
+ 
+         transcript = pd.DataFrame(words)
+         return transcript
+@@ -179,7 +202,7 @@ class ExtractWordsFromAudio(EventsTransform):
+                     logger.warning(f"Empty transcript file {transcript_filename}")
+             else:
+                 transcript = self._get_transcript_from_audio(
+-                    wav_filename, self.language
++                    wav_filename, self.language, self.task
+                 )
+                 transcript.to_csv(transcript_filename, sep="\t", index=False)
+                 logger.info(f"Wrote transcript to {transcript_filename}")
+@@ -201,7 +224,7 @@ class ExtractWordsFromAudio(EventsTransform):
+                     continue
+                 transcript.loc[:, k] = v
+             transcript["type"] = "Word"
+-            transcript["language"] = self.language
++            transcript["language"] = self.output_language
+             transcript["start"] += audio_event.start + audio_event.offset
+             all_transcripts.append(transcript)
+ 

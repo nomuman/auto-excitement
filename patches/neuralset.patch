@@ -1,0 +1,17 @@
+--- a/neuralset/utils.py
++++ b/neuralset/utils.py
+@@ -378,12 +378,14 @@
+             "en": "english",
+             "fr": "french",
+             "es": "spanish",
+             "zh": "chinese",
++            "ja": "japanese",
+         }
+         language = _iso_to_lang.get(language, language)
+         defaults = dict(
+             english="en_core_web_lg",
+             french="fr_core_news_lg",
+             spanish="es_core_news_lg",
+             chinese="zh_core_web_lg",
++            japanese="ja_core_news_lg",
+         )

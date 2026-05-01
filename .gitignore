@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Project caches and uploaded artifacts
+cache/
+static/videos/
+static/thumbs/
+static/brain/
+
+# tribev2 upstream sources are managed separately (see patches/ and README)
+tribev2-src/
+
+# Server logs
+*.log
+nohup.out
