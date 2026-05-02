@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <title>TRIBEv2 Viewer — fMRI 推定</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+} }
+</script>
 <style>
   body { font-family: -apple-system, sans-serif; max-width: 1100px; margin: 1.5rem auto; padding: 0 1rem; color: #222; }
   h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
@@ -16,7 +22,7 @@
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .status { color: #555; font-size: 0.9rem; }
   .progress { background: #eee; border-radius: 4px; height: 14px; margin: 0.4rem 0; overflow: hidden; }
-  .progress > div { height: 100%; background: linear-gradient(90deg,#3498db,#1abc9c); transition: width .3s; }
+  .progress > div { height: 100%; background: linear-gradient(90deg,#3498db,#1abc9c); transition: width 1s linear; will-change: width; }
   .phase { font-size: 0.8rem; color: #666; min-height: 1.1em; }
   .scores { display: flex; gap: 0.5rem; margin: 0.6rem 0; flex-wrap: wrap; }
   .score { flex: 1 1 22%; padding: 0.4rem 0.5rem; background: #f4f4f4; border-radius: 4px; min-width: 110px; }
@@ -29,6 +35,10 @@
   canvas { background: #fff; }
   details { margin-top: 1rem; color: #555; font-size: 0.85rem; }
   .log { font-family: monospace; font-size: 0.75rem; color: #888; max-height: 6em; overflow: auto; background: #fafafa; padding: 0.3rem 0.5rem; border-radius: 3px; margin-top: 0.5rem; }
+  .brain-wrap { margin-top: 1rem; border: 1px solid #eee; border-radius: 4px; padding: 0.4rem 0.6rem; background: #fafafa; }
+  .brain-wrap h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .brain-wrap canvas { width: 100%; height: 360px; display: block; background: linear-gradient(180deg,#1a1f2c,#0a0e16); border-radius: 4px; touch-action: none; }
+  .brain-wrap .meta { font-size: 0.78rem; color: #888; margin-top: 0.3rem; font-family: monospace; }
   .filmstrip-wrap { margin-top: 1rem; }
   .filmstrip-wrap h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: #333; }
   .filmstrip { display: flex; overflow-x: auto; gap: 2px; padding-bottom: 0.4rem; border: 1px solid #eee; border-radius: 4px; background: #fafafa; }
@@ -128,6 +138,19 @@
   </div>
 </div>
 
+<div class="brain-wrap" id="brainWrap" style="display:none">
+  <h3>fsaverage5 脳活動（クライアント側 WebGL レンダリング）
+    <span style="font-weight:normal;color:#888;font-size:0.78rem;">— ドラッグ回転 / ホイール拡大 / 動画再生位置に追従</span>
+    <span style="flex:1"></span>
+    <label style="font-size:0.8rem;color:#555;font-weight:normal;">閾値
+      <input type="range" id="brainThresh" min="0" max="1" step="0.02" value="0.6" style="width:120px;vertical-align:middle;">
+      <span id="brainThreshVal" style="font-family:monospace;">0.60</span>
+    </label>
+  </h3>
+  <canvas id="brainCanvas"></canvas>
+  <div class="meta" id="brainMeta">—</div>
+</div>
+
 <div class="cut-tool" id="cutTool">
   <h3>退屈カット
     <span style="font-weight:normal;color:#666;font-size:0.8rem;">— excitement &lt;</span>
@@ -200,19 +223,55 @@ const PHASES = [
   ["Encoding video",     12, 60],
   ["Building dataloader",60, 62],
   ["Reducing",           62, 64],
-  ["Extracting thumbnails", 64, 68],
-  ["Decoding audio waveform", 68, 70],
-  ["Rendering brain",    70,100],
+  ["Extracting thumbnails", 64, 80],
+  ["Decoding audio waveform", 80, 92],
+  ["Saving predictions", 92, 100],
 ];
+
+// Smoothly drift bar between SSE updates. We track recent updates to estimate
+// the velocity (% per ms) for the active phase and tween toward an extrapolated
+// target so the bar moves continuously instead of jumping every ~1.3 s.
+let _barTarget = 0;             // latest server-reported target (%)
+let _barCurrent = 0;            // visually displayed value (%)
+let _barLastTargetTs = 0;       // when _barTarget was last updated
+let _barVelocity = 0;           // %/ms estimate from last two updates
+let _barCap = 100;              // never extrapolate beyond this within a phase
 
 function setBarFromPhase(phase, pct) {
   for (const [needle, lo, hi] of PHASES) {
     if (phase.toLowerCase().includes(needle.toLowerCase())) {
-      const w = lo + (hi - lo) * (pct/100);
-      barEl.style.width = w.toFixed(1) + '%';
+      const w = lo + (hi - lo) * Math.max(0, Math.min(100, pct)) / 100;
+      const now = performance.now();
+      const dt = now - _barLastTargetTs;
+      if (_barLastTargetTs > 0 && dt > 30 && w > _barTarget) {
+        _barVelocity = (w - _barTarget) / dt;
+      }
+      _barTarget = Math.max(_barTarget, w);
+      _barLastTargetTs = now;
+      _barCap = hi;
       return;
     }
   }
+}
+
+function _barTick() {
+  const now = performance.now();
+  const dt = now - _barLastTargetTs;
+  // Extrapolate forward at recent velocity, never more than half a step ahead
+  // and never past the current phase ceiling.
+  let predicted = _barTarget + _barVelocity * Math.min(dt, 1500);
+  predicted = Math.min(predicted, _barCap);
+  // Smoothly approach the predicted value (exp smoothing)
+  _barCurrent += (predicted - _barCurrent) * 0.2;
+  if (Math.abs(predicted - _barCurrent) < 0.02) _barCurrent = predicted;
+  barEl.style.width = _barCurrent.toFixed(2) + '%';
+  requestAnimationFrame(_barTick);
+}
+requestAnimationFrame(_barTick);
+
+function resetBar() {
+  _barTarget = 0; _barCurrent = 0; _barLastTargetTs = 0; _barVelocity = 0; _barCap = 100;
+  barEl.style.width = '0%';
 }
 
 function appendLog(s) {
@@ -243,7 +302,7 @@ runBtn.onclick = async () => {
   if (evtSource) evtSource.close();
   runBtn.disabled = true;
   logEl.innerHTML = '';
-  barEl.style.width = '0%';
+  resetBar();
   phaseEl.textContent = '';
   const sizeMB = (f.size/1e6).toFixed(1);
   statusEl.textContent = `アップロード開始… (${sizeMB} MB)`;
@@ -299,13 +358,14 @@ runBtn.onclick = async () => {
   };
   evtSource.addEventListener('result', (ev) => {
     data = JSON.parse(ev.data);
-    barEl.style.width = '100%';
+    _barTarget = 100; _barCap = 100;
     phaseEl.textContent = '';
     const dt = ((Date.now()-t0)/1000).toFixed(1);
     statusEl.textContent = `完了 (${dt}s, セグメント ${data.n_segments}, TR ${data.tr.toFixed(2)}s)`;
     drawChart();
     renderFilmstrip();
     renderTimeline();
+    loadBrainForJob();
     evtSource.close();
     runBtn.disabled = false;
   });
@@ -726,6 +786,186 @@ const cursorPlugin = {
 };
 
 let _lastIdx = -1;
+// === WebGL brain viewer (Three.js) =================================================
+let _brainModule = null;
+async function loadBrainModule() {
+  if (_brainModule) return _brainModule;
+  const THREE = await import('three');
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  _brainModule = { THREE, OrbitControls };
+  return _brainModule;
+}
+const FIRE_LUT = (() => {
+  const a = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let r, g, b;
+    if (t < 0.33) { r = t/0.33; g = 0; b = 0; }
+    else if (t < 0.66) { r = 1; g = (t-0.33)/0.33; b = 0; }
+    else { r = 1; g = 1; b = (t-0.66)/0.34; }
+    a[i*3]   = Math.min(255, Math.round(r*255));
+    a[i*3+1] = Math.min(255, Math.round(g*255));
+    a[i*3+2] = Math.min(255, Math.round(b*255));
+  }
+  return a;
+})();
+function halfToFloat(h) {
+  const s = (h & 0x8000) >> 15;
+  const e = (h & 0x7C00) >> 10;
+  const f = h & 0x03FF;
+  if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+  if (e === 31) return f ? NaN : (s ? -Infinity : Infinity);
+  return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+async function fetchMesh(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const dv = new DataView(buf);
+  let o = 0;
+  const nVL = dv.getUint32(o, true); o += 4;
+  const nFL = dv.getUint32(o, true); o += 4;
+  const nVR = dv.getUint32(o, true); o += 4;
+  const nFR = dv.getUint32(o, true); o += 4;
+  const vL = new Float32Array(buf, o, nVL*3); o += nVL*3*4;
+  const fL = new Uint32Array (buf, o, nFL*3); o += nFL*3*4;
+  const sL = new Float32Array(buf, o, nVL);   o += nVL*4;
+  const vR = new Float32Array(buf, o, nVR*3); o += nVR*3*4;
+  const fR = new Uint32Array (buf, o, nFR*3); o += nFR*3*4;
+  const sR = new Float32Array(buf, o, nVR);   o += nVR*4;
+  return { vL, fL, sL, vR, fR, sR, nVL, nFL, nVR, nFR };
+}
+async function fetchPreds(url, shape) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const u16 = new Uint16Array(buf);
+  const out = new Float32Array(u16.length);
+  for (let i = 0; i < u16.length; i++) out[i] = halfToFloat(u16[i]);
+  return out;  // shape: [T*V] flat
+}
+const brainState = {
+  inited: false, scene: null, cam: null, renderer: null, controls: null,
+  hemis: [],          // [{mesh, colors:Float32Array, sulc, nV}]
+  preds: null,        // Float32Array length T*V
+  T: 0, V: 0,
+  threshold: 0.6,
+  lastIdx: -1, lastThresh: -1,
+};
+async function initBrainViewer(meshUrl) {
+  const { THREE, OrbitControls } = await loadBrainModule();
+  const canvas = document.getElementById('brainCanvas');
+  const mesh = await fetchMesh(meshUrl);
+  brainState.scene = new THREE.Scene();
+  brainState.scene.background = new THREE.Color(0x0a0e16);
+  const w = canvas.clientWidth || 800, h = canvas.clientHeight || 360;
+  brainState.cam = new THREE.PerspectiveCamera(35, w/h, 1, 5000);
+  brainState.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  brainState.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  brainState.renderer.setSize(w, h, false);
+  brainState.controls = new OrbitControls(brainState.cam, canvas);
+  brainState.controls.enableDamping = true; brainState.controls.dampingFactor = 0.1;
+  brainState.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.85); dl.position.set(60, 200, 200); brainState.scene.add(dl);
+
+  function buildHemi(verts, faces, sulc, nV) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geo.setIndex(new THREE.BufferAttribute(faces, 1));
+    geo.computeVertexNormals();
+    const colors = new Float32Array(nV * 3);
+    let smin = Infinity, smax = -Infinity;
+    for (let i = 0; i < nV; i++) { if (sulc[i] < smin) smin = sulc[i]; if (sulc[i] > smax) smax = sulc[i]; }
+    const span = Math.max(1e-9, smax - smin);
+    for (let i = 0; i < nV; i++) {
+      const t = (sulc[i] - smin) / span;
+      const g = 0.30 + (1 - t) * 0.45;
+      colors[i*3] = g; colors[i*3+1] = g; colors[i*3+2] = g;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const mat = new THREE.MeshStandardMaterial({
+      vertexColors: true, metalness: 0.0, roughness: 0.85, side: THREE.DoubleSide,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    brainState.scene.add(m);
+    return { mesh: m, colors, sulc, smin, span, nV };
+  }
+  brainState.hemis = [
+    buildHemi(mesh.vL, mesh.fL, mesh.sL, mesh.nVL),
+    buildHemi(mesh.vR, mesh.fR, mesh.sR, mesh.nVR),
+  ];
+
+  // frame the camera
+  const box = new (await loadBrainModule()).THREE.Box3();
+  for (const h of brainState.hemis) box.expandByObject(h.mesh);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  brainState.controls.target.copy(center);
+  brainState.cam.position.set(center.x, center.y + size*0.05, center.z + size*1.05);
+  brainState.cam.lookAt(center);
+
+  document.getElementById('brainMeta').textContent =
+    `mesh L ${mesh.nVL}v / ${mesh.nFL}f, R ${mesh.nVR}v / ${mesh.nFR}f`;
+
+  new ResizeObserver(() => {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    brainState.renderer.setSize(w, h, false);
+    brainState.cam.aspect = w / h; brainState.cam.updateProjectionMatrix();
+  }).observe(canvas);
+
+  brainState.inited = true;
+  (function loop() {
+    if (!brainState.inited) return;
+    brainState.controls.update();
+    brainState.renderer.render(brainState.scene, brainState.cam);
+    requestAnimationFrame(loop);
+  })();
+}
+function applyBrainColors(idx) {
+  if (!brainState.inited || !brainState.preds) return;
+  const V = brainState.V;
+  const T = brainState.T;
+  if (idx < 0) idx = 0; else if (idx >= T) idx = T - 1;
+  const off = idx * V;
+  let cursor = 0;
+  for (const h of brainState.hemis) {
+    const nV = h.nV;
+    for (let i = 0; i < nV; i++) {
+      const a = brainState.preds[off + cursor + i];      // already in [0, 1]
+      if (a < brainState.threshold) {
+        const t = (h.sulc[i] - h.smin) / h.span;
+        const g = 0.30 + (1 - t) * 0.45;
+        h.colors[i*3] = g; h.colors[i*3+1] = g; h.colors[i*3+2] = g;
+      } else {
+        const lutT = (a - brainState.threshold) / Math.max(1e-9, 1 - brainState.threshold);
+        const li = Math.min(255, Math.max(0, Math.floor(lutT * 255)));
+        h.colors[i*3]   = FIRE_LUT[li*3]   / 255;
+        h.colors[i*3+1] = FIRE_LUT[li*3+1] / 255;
+        h.colors[i*3+2] = FIRE_LUT[li*3+2] / 255;
+      }
+    }
+    h.mesh.geometry.attributes.color.needsUpdate = true;
+    cursor += nV;
+  }
+}
+async function loadBrainForJob() {
+  if (!data || !data.preds_url || !data.mesh_url) return;
+  document.getElementById('brainWrap').style.display = '';
+  if (!brainState.inited) {
+    try { await initBrainViewer(data.mesh_url); }
+    catch (e) {
+      document.getElementById('brainMeta').textContent = 'WebGL init 失敗: ' + e.message;
+      console.error(e); return;
+    }
+  }
+  const [T, V] = data.preds_shape;
+  brainState.preds = await fetchPreds(data.preds_url, data.preds_shape);
+  brainState.T = T; brainState.V = V;
+  brainState.lastIdx = -1; brainState.lastThresh = -1;
+  applyBrainColors(0);
+}
+document.getElementById('brainThresh').addEventListener('input', (e) => {
+  brainState.threshold = parseFloat(e.target.value);
+  document.getElementById('brainThreshVal').textContent = brainState.threshold.toFixed(2);
+  brainState.lastThresh = -1;  // force redraw
+});
+
 function tick() {
   if (chart && data) {
     chart.draw();
@@ -740,6 +980,9 @@ function tick() {
     });
     updateTimelineCursor();
     if (i !== _lastIdx) { updateFilmstripCursor(i); _lastIdx = i; }
+    if (brainState.inited && brainState.preds && (i !== brainState.lastIdx || brainState.lastThresh !== brainState.threshold)) {
+      applyBrainColors(i); brainState.lastIdx = i; brainState.lastThresh = brainState.threshold;
+    }
   }
   requestAnimationFrame(tick);
 }

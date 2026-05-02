@@ -94,6 +94,78 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     return np.zeros_like(x) if s < 1e-9 else (x - x.mean()) / s
 
 
+def _patch_video_extractor_autocast() -> None:
+    """Wrap neuralset's HuggingFace video extractor in CUDA fp16 autocast for ~1.5x speedup
+    on V-JEPA2-ViT-g without changing model weights. Outputs auto-cast back to fp32."""
+    import torch as _torch
+    from neuralset.extractors import video as _ns_video
+
+    if getattr(_ns_video._HFVideoModel, "_viewer_autocast_patched", False):
+        return
+    _orig_predict = _ns_video._HFVideoModel.predict
+
+    def _autocast_predict(self, images, audio=None):
+        if _torch.cuda.is_available():
+            with _torch.autocast(device_type="cuda", dtype=_torch.float16):
+                return _orig_predict(self, images, audio)
+        return _orig_predict(self, images, audio)
+
+    _ns_video._HFVideoModel.predict = _autocast_predict
+    _ns_video._HFVideoModel._viewer_autocast_patched = True
+    log.info("Video extractor predict() wrapped with CUDA fp16 autocast")
+
+
+def _dump_fsaverage5_mesh() -> str:
+    """Dump a half-inflated fsaverage5 mesh + sulcal background as a packed binary
+    that the browser fetches once and renders client-side via Three.js.
+    Layout (little-endian):
+        u32 n_verts_L, u32 n_faces_L, u32 n_verts_R, u32 n_faces_R
+        f32[n_verts_L,3] verts_L, u32[n_faces_L,3] faces_L, f32[n_verts_L] sulc_L
+        f32[n_verts_R,3] verts_R, u32[n_faces_R,3] faces_R, f32[n_verts_R] sulc_R
+    """
+    out = STATIC / "mesh" / "fsaverage5.bin"
+    if out.exists():
+        return f"/static/mesh/{out.name}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    import nibabel
+    from nilearn import datasets
+    fsavg = datasets.fetch_surf_fsaverage("fsaverage5")
+
+    def load_gii(p):
+        g = nibabel.load(p)
+        return g.darrays[0].data.astype(np.float32), g.darrays[1].data.astype(np.uint32)
+
+    def load_scalar(p):
+        return nibabel.load(p).darrays[0].data.astype(np.float32)
+
+    pial_l_v, _ = load_gii(fsavg.pial_left)
+    infl_l_v, infl_l_f = load_gii(fsavg.infl_left)
+    pial_r_v, _ = load_gii(fsavg.pial_right)
+    infl_r_v, infl_r_f = load_gii(fsavg.infl_right)
+    half_l = ((pial_l_v + infl_l_v) * 0.5).astype(np.float32)
+    half_r = ((pial_r_v + infl_r_v) * 0.5).astype(np.float32)
+    # offset hemispheres horizontally so they don't overlap when rendered together
+    span_l = float(half_l[:, 0].max() - half_l[:, 0].min())
+    span_r = float(half_r[:, 0].max() - half_r[:, 0].min())
+    half_l = half_l.copy(); half_l[:, 0] -= half_l[:, 0].max() + 6
+    half_r = half_r.copy(); half_r[:, 0] -= half_r[:, 0].min() - 6
+    sulc_l = load_scalar(fsavg.sulc_left)
+    sulc_r = load_scalar(fsavg.sulc_right)
+
+    import struct
+    with out.open("wb") as f:
+        f.write(struct.pack("<IIII",
+                            half_l.shape[0], infl_l_f.shape[0],
+                            half_r.shape[0], infl_r_f.shape[0]))
+        f.write(half_l.tobytes()); f.write(infl_l_f.tobytes()); f.write(sulc_l.tobytes())
+        f.write(half_r.tobytes()); f.write(infl_r_f.tobytes()); f.write(sulc_r.tobytes())
+    log.info(f"mesh dumped {out} ({out.stat().st_size} bytes, "
+             f"L={half_l.shape[0]} verts/{infl_l_f.shape[0]} faces, "
+             f"R={half_r.shape[0]} verts/{infl_r_f.shape[0]} faces)")
+    return f"/static/mesh/{out.name}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Loading atlas ...")
@@ -103,22 +175,14 @@ async def lifespan(app: FastAPI):
     log.info("Loading TribeModel ...")
     import matplotlib
     matplotlib.use("Agg")
+    _patch_video_extractor_autocast()
     from tribev2 import TribeModel
-    from tribev2.plotting import PlotBrainNilearn
     from imageio_ffmpeg import get_ffmpeg_exe
     state["ffmpeg"] = get_ffmpeg_exe()
+    state["mesh_url"] = _dump_fsaverage5_mesh()
     state["model"] = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE)
-    state["plotter"] = PlotBrainNilearn(mesh="fsaverage5", inflate="half", bg_map="sulcal")
-    # warm up the brain renderer to avoid first-call latency in the worker
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 2, figsize=(4, 2), subplot_kw={"projection": "3d"},
-                              gridspec_kw={"wspace": 0, "hspace": 0})
-    state["plotter"].plot_surf(np.zeros(20484, dtype=np.float32),
-                                axes=[axes[0], axes[1]], views=["left", "right"],
-                                cmap="fire", vmin=0.6, alpha_cmap=(0, 0.2))
-    plt.close(fig)
     state["lock"] = threading.Lock()
-    log.info(f"Ready. ffmpeg={state['ffmpeg']}")
+    log.info(f"Ready. ffmpeg={state['ffmpeg']}, mesh={state['mesh_url']}")
     yield
 
 
@@ -225,36 +289,22 @@ def _words_from_events(df) -> list[dict]:
     return out
 
 
-def _render_brains(job_id: str, preds: np.ndarray, q: queue.Queue) -> list[str]:
-    """Render one brain panel (left+right lateral) per timestep, save as PNG."""
-    import matplotlib.pyplot as plt
+def _save_preds_binary(job_id: str, preds: np.ndarray) -> dict:
+    """Persist (T, V) predictions as a float16 blob in [0,1] (robust-normalised) so the
+    browser only has to apply a threshold cutoff and look up the fire colormap.
+    """
     from tribev2.plotting.utils import robust_normalize
-
-    out_dir = STATIC / "brain" / job_id
+    out_dir = STATIC / "preds"
     out_dir.mkdir(parents=True, exist_ok=True)
-    plotter = state["plotter"]
-    preds_norm = robust_normalize(preds, percentile=99)  # global [0,1]
-    n = preds.shape[0]
-    urls: list[str] = []
-    for i in range(n):
-        fig, axes = plt.subplots(
-            1, 2, figsize=(4, 2),
-            subplot_kw={"projection": "3d"},
-            gridspec_kw={"wspace": 0, "hspace": 0},
-        )
-        plotter.plot_surf(
-            preds_norm[i], axes=[axes[0], axes[1]], views=["left", "right"],
-            cmap="fire", vmin=0.6, alpha_cmap=(0, 0.2),
-        )
-        out = out_dir / f"{i:04d}.png"
-        fig.savefig(out, bbox_inches="tight", pad_inches=0, dpi=72,
-                    facecolor="white", transparent=False)
-        plt.close(fig)
-        urls.append(f"/static/brain/{job_id}/{out.name}")
-        if (i + 1) % max(1, n // 25) == 0 or i == n - 1:
-            q.put({"type": "progress", "phase": "Rendering brain",
-                   "percent": int(100 * (i + 1) / n)})
-    return urls
+    out = out_dir / f"{job_id}.bin"
+    norm = robust_normalize(preds, percentile=99).astype(np.float16)  # in [0, 1]
+    norm.tofile(out)
+    return {
+        "preds_url": f"/static/preds/{out.name}",
+        "preds_dtype": "float16",
+        "preds_shape": list(preds.shape),
+        "preds_normalized": True,
+    }
 
 
 def _extract_thumbs(job_id: str, video_path: Path, times: list[float], q: queue.Queue) -> list[dict]:
@@ -306,7 +356,10 @@ def _run_job(job_id: str, video_path: Path, language: str = "english") -> None:
             res["waveform"] = _audio_envelope(video_path)
             res["words"] = words
             job.q.put({"type": "progress", "phase": "Decoding audio waveform", "percent": 100})
-            res["brain_urls"] = _render_brains(job_id, preds, job.q)
+            job.q.put({"type": "progress", "phase": "Saving predictions", "percent": 50})
+            res.update(_save_preds_binary(job_id, preds))
+            res["mesh_url"] = state["mesh_url"]
+            job.q.put({"type": "progress", "phase": "Saving predictions", "percent": 100})
             res["elapsed_sec"] = round(time.time() - started, 2)
             job.result = res
             job.q.put({"type": "done"})
@@ -343,25 +396,51 @@ async def events(job_id: str):
         raise HTTPException(404, "unknown job")
 
     async def gen():
-        loop = asyncio.get_event_loop()
-        while True:
+        # Tight 50 ms poll: drain everything available, then await briefly. Avoids the
+        # per-message run_in_executor round-trip that was bottlenecking delivery during
+        # bursts (e.g. fast-arriving tqdm updates between long V-JEPA iterations).
+        last_keepalive = time.time()
+        terminated = False
+        while not terminated:
+            drained = False
             try:
-                msg = await loop.run_in_executor(None, lambda: job.q.get(timeout=1.0))
+                while True:
+                    msg = job.q.get_nowait()
+                    drained = True
+                    yield f"data: {json.dumps(msg)}\n\n"
+                    if msg.get("type") in ("done", "error"):
+                        terminated = True
+                        break
             except queue.Empty:
-                if job.done:
-                    break
-                yield ": keepalive\n\n"
-                continue
-            yield f"data: {json.dumps(msg)}\n\n"
-            if msg.get("type") in ("done", "error"):
+                pass
+            if terminated:
                 break
+            if drained:
+                # let the loop ferry chunks downstream before we re-enter the drain
+                await asyncio.sleep(0)
+                continue
+            if job.done:
+                break
+            # idle: brief sleep + occasional keepalive so proxies don't drop us
+            await asyncio.sleep(0.05)
+            now = time.time()
+            if now - last_keepalive > 12:
+                yield ": keepalive\n\n"
+                last_keepalive = now
+
         if job.result is not None:
             yield f"event: result\ndata: {json.dumps(job.result)}\n\n"
         elif job.error:
             yield f"event: error\ndata: {json.dumps({'message': job.error})}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 if __name__ == "__main__":

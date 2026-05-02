@@ -11,6 +11,8 @@ cache/
 static/videos/
 static/thumbs/
 static/brain/
+static/mesh/
+static/preds/
 
 # tribev2 upstream sources are managed separately (see patches/ and README)
 tribev2-src/
