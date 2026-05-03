@@ -1,122 +1,156 @@
 # Auto Excitement
 
-短い動画をブラウザにアップロードすると、Meta の `facebook/tribev2` モデルが
-fsaverage5 表面 (20484 頂点) の BOLD 反応を予測 → Yeo7 ネットワーク平均と
-多次元ブレインステート軸 + PCA latent → 動画再生に同期して時系列・脳画像・
-タイムラインを表示し、退屈区間の ffmpeg カット script まで吐き出す
-シングルファイル GUI です。
+Upload a short video in the browser and watch Meta's `facebook/tribev2`
+model predict the BOLD response on the fsaverage5 cortical surface
+(20,484 vertices) — collapsed into 7 Yeo networks plus a 4-axis brain
+state and a PCA latent. The page renders the predicted brain on the
+client with WebGL, in sync with the video, and exports an `ffmpeg`
+script that cuts the boring stretches.
 
-## できること
+## What it does
 
-- 動画 (mp4/webm/mov…) のアップロードと進捗バー（実バイト数 + 転送速度）
-- WhisperX で音声→単語タイムスタンプ。**日本語**（そのまま、または英訳して推論）も対応
-- TRIBEv2 で 20484 頂点 × N TR の BOLD 予測
-- 結果可視化:
-  - 動画プレーヤ＋再生位置に追従する縦カーソル
-  - Chart.js: Yeo7 ネットワーク平均 + 4 軸（Excitement / Valence / Cognitive Load / Novelty）
-  - サムネイル × 脳活動マップ（fsaverage5 上の予測活動を fire colormap で）の filmstrip
-  - 音声波形 + 文字起こし + 4 軸線グラフ + PCA top-3 のスタックドタイムライン
-  - 4 軸スコアのリアルタイム数値表示
-- Excitement 閾値で**退屈シーンを自動カット**:
-  - 閾値・最低継続秒数のスライダ、保持区間のグレーアウトプレビュー
-  - ブラウザ内**プレビュー再生**（カット区間を即時にスキップ）
-  - `ffmpeg` の `select` フィルタを組んだ `.sh` ファイル / コマンドの書き出し
+- Video upload (`mp4` / `webm` / `mov` / …) with a real progress bar
+  (live byte count + transfer rate)
+- WhisperX → word-level transcript. **Japanese** works either as-is or
+  translated-to-English for inference (recommended)
+- TRIBEv2 inference: `(N_TR, 20484)` BOLD predictions
+- Visualisation:
+  - Video player with a vertical cursor synced across all panels
+  - Chart.js: 7 Yeo networks + 4 brain-state axes (Excitement / Valence
+    / Cognitive Load / Novelty)
+  - **Live WebGL brain** (Three.js) on the half-inflated fsaverage5
+    mesh: drag to rotate, wheel to zoom, vertex colors update at 60 fps
+    against the video time
+  - Filmstrip of per-segment thumbnails (click to seek)
+  - Stacked timeline: audio waveform + word transcript + 4 axes + PCA
+    top-3
+  - Per-axis live readouts
+- **Boring-segment cutter** driven by the Excitement axis:
+  - Threshold and minimum-keep-duration sliders, dropped ranges greyed
+    out across all timeline lanes
+  - In-browser preview that skips the dropped intervals on playback
+  - Generates a one-shot `ffmpeg` `select`/`aselect` filter command +
+    downloadable `.sh`
 
-## ディレクトリ構成
+## Layout
 
-| パス | 役割 |
+| Path | Role |
 |---|---|
-| `server.py` | FastAPI サーバ。TribeModel・Yeo7 アトラス・matplotlib プロッタを起動時に常駐させ、SSE で進捗を流す |
-| `build_atlas.py` | Yeo 2011 7-network MNI152 ボリュームを fsaverage5 表面へ投影 |
-| `smoke_predict.py` | モデル単体のスモークテスト |
-| `static/index.html` | 単一ページ GUI（Chart.js を CDN から読み込み） |
-| `patches/` | 上流 `facebookresearch/tribev2` と `neuralset` への必須パッチ（後述） |
-| `cache/` *(.gitignore)* | モデル中間ファイル + アトラス |
-| `static/videos/` *(.gitignore)* | アップロード済み動画（静的配信） |
-| `static/thumbs/`, `static/brain/` *(.gitignore)* | 生成サムネ・脳活動 PNG |
-| `tribev2-src/` *(.gitignore)* | 上流 tribev2 クローン。別途自分で clone する |
+| `server.py` | FastAPI server — keeps TribeModel and the Yeo7 atlas resident, streams progress over SSE |
+| `build_atlas.py` | Project the Yeo 2011 7-network MNI152 volume onto fsaverage5 |
+| `smoke_predict.py` | Stand-alone model smoke test |
+| `static/index.html` | Single-page GUI (Chart.js + Three.js from CDN) |
+| `patches/` | Required patches against upstream `facebookresearch/tribev2` and `neuralset` (see below) |
+| `cache/` *(.gitignore)* | Model intermediates + atlas |
+| `static/videos/` *(.gitignore)* | Uploaded videos served back to the player |
+| `static/thumbs/` *(.gitignore)* | Per-segment thumbnail jpegs |
+| `static/mesh/` *(.gitignore)* | Generated fsaverage5 mesh blob (rebuilt at startup) |
+| `static/preds/` *(.gitignore)* | Per-job float16 prediction blobs |
+| `tribev2-src/` *(.gitignore)* | Upstream tribev2 clone — clone separately |
 
-## セットアップ
+## Setup
 
 ```bash
-git clone <THIS REPO>
-cd tribev2-viewer
+git clone https://github.com/shi3z/auto-excitement.git
+cd auto-excitement
 
-# 1) tribev2 上流を別途 clone（このリポジトリには含まれない）
+# 1) Clone the upstream tribev2 sources alongside this repo
 git clone https://github.com/facebookresearch/tribev2.git tribev2-src
 
-# 2) venv と依存関係
+# 2) venv + dependencies
 python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 pip install -e ./tribev2-src
 
-# 3) 必須パッチ（日本語対応 + --task translate のため）
+# 3) Apply the required patches (Japanese support + --task translate route)
 patches/apply.sh
 
-# 4) Yeo7 アトラスを fsaverage5 へ投影
+# 4) Project the Yeo7 atlas to fsaverage5
 python build_atlas.py
 
-# 5) 日本語 spaCy モデル（japanese / japanese_translate モードで必要）
+# 5) Japanese spaCy model (only needed for `japanese` / `japanese_translate` modes)
 python -m spacy download ja_core_news_lg
 ```
 
-`uvx whisperx` がパス上にあること（音声→単語タイムスタンプ）。
-GPU は CUDA 対応推奨。CPU でも動くが V-JEPA2 が桁違いに遅い。
+`uvx whisperx` must be on `PATH` (used for word-level timestamps).
+A CUDA GPU is strongly recommended — the V-JEPA2 video encoder is the
+single hottest path even with the fp16 autocast we apply at startup.
 
-### 上流に当てているパッチ
+### Upstream patches we apply
 
-`patches/apply.sh` が以下を当てます（再実行は no-op）:
+`patches/apply.sh` is idempotent; re-running it is a no-op.
 
-- `patches/tribev2.patch` — `ExtractWordsFromAudio` に `task` (transcribe/translate) を追加、`japanese="ja"` を WhisperX 言語マップへ追加、`--align_model` の空文字バグ修正、`get_audio_and_text_events`/`get_events_dataframe` に `language` 引数を追加、`japanese_translate` 擬似言語の経路を追加
-- `patches/neuralset.patch` — `neuralset/utils.py` の spaCy 言語マップに `japanese="ja_core_news_lg"` と ISO `"ja"→"japanese"` を追加
+- `patches/tribev2.patch` — adds `task` (`transcribe`/`translate`) to
+  `ExtractWordsFromAudio`, registers `japanese="ja"` in the WhisperX
+  language map, fixes the empty-string `--align_model` bug for non-English
+  runs, threads a `language` kwarg through `get_audio_and_text_events` /
+  `get_events_dataframe`, and adds the `japanese_translate` pseudo-language
+- `patches/neuralset.patch` — adds `japanese="ja_core_news_lg"` and the ISO
+  alias `"ja"→"japanese"` to neuralset's spaCy language map
 
-## 起動
+## Run
 
 ```bash
 source venv/bin/activate
 python server.py            # http://localhost:8000
 ```
 
-`mp4` などを選択して **予測する** を押すと、
+Pick an `mp4` (or webm/mov/…) and hit **予測する**:
 
-1. アップロード（バイト数進捗）
-2. サーバが `model.get_events_dataframe(video_path=..., language=...)` でイベント DF 構築
-3. `model.predict(events=df)` が 20484 頂点 × N セグメントを出す
-4. Yeo7 ネットワーク平均化 + 4 軸 + PCA top-3 を計算、サムネ + 脳画像 + 波形を生成
-5. SSE 経由でフロントへ、Chart.js + filmstrip + タイムライン + 退屈カットツールが現れる
+1. Upload (with byte-level progress)
+2. Server builds the events DataFrame via
+   `model.get_events_dataframe(video_path=..., language=...)`
+3. `model.predict(events=df)` produces `(N, 20484)` predictions
+4. Server reduces to Yeo7 means, the 4 axes, and the top-3 PCA components,
+   extracts thumbnails + audio waveform, and writes a packed float16 blob
+   of the normalised predictions
+5. Result is streamed to the browser via SSE; the page lights up with
+   chart, filmstrip, timeline, the WebGL brain, and the cut tool
 
-性能の目安: 52 秒の Sintel クリップで end-to-end 約 4–5 分（動画 extractor が支配的）。
+Performance reference (52-second Sintel clip, single CUDA GPU):
 
-## 4 軸の定義（経験則プロキシ + PCA latent）
+| Stage | Before | After (fp16 + WebGL) |
+|---|---|---|
+| V-JEPA2 encoding | 137 s (1.32 s/it) | 46 s (2.23 it/s) |
+| Server-side brain PNG render | 70 s | 0 s (moved to client) |
+| End-to-end | 270 s (5.2× slower than realtime) | 78 s (1.5× slower) |
+
+## The 4 brain-state axes (heuristic proxies + PCA latent)
 
 ```
-Excitement     = (z(VIS+SMN+DAN+VAN) − z(DMN)) / 2     # 感覚・注意の関与
-Valence        = z(Limbic)                              # 感情価のプロキシ
-Cognitive Load = z(mean(FrontoParietal, DorsalAttn))    # 制御要求／作業記憶
-Novelty        = z(VAN − mean(全 Yeo7))                 # Salience の baseline 超過分（≈予測誤差）
-PC1–PC3        = numpy.linalg.svd(preds_centered) の上位 3 成分（z-score）
+Excitement     = (z(VIS+SMN+DAN+VAN) − z(DMN)) / 2     # sensory + attentional engagement
+Valence        = z(Limbic)                              # affective tone proxy
+Cognitive Load = z(mean(FrontoParietal, DorsalAttn))    # control / working memory demand
+Novelty        = z(VAN − mean(all 7 Yeo networks))      # salience above baseline (≈ prediction error)
+PC1 – PC3      = top three principal components of the centred (T, V) prediction matrix (z-scored)
 ```
 
-> **注**：軸の名前は事後解釈。`Cognitive Load` の絶対値や、`Novelty` を主観的「驚き」と
-> 直結させるのは過大解釈です。1 次元の「興奮↔退屈」では捉えきれない部分を、独立軸 +
-> 純データ駆動の latent 空間で補っているという位置付け。
+> **Caveat.** The axis names are post-hoc interpretations — don't read
+> "Cognitive Load" as a literal cognitive load score, or "Novelty" as a
+> subjective-surprise meter. The point is to leave the 1-D
+> "excitement ↔ boredom" framing behind: independent named axes plus a
+> data-driven latent space give a much richer view of the predicted
+> brain state.
 
 ## API
 
 `POST /predict` (multipart):
-- `video` (file) — 動画
-- `language` (str, default `english`) — `english` / `japanese` / `japanese_translate` / `french` / `spanish` / `dutch` / `chinese`
 
-レスポンス: `{job_id, video_url, language}`
+- `video` (file)
+- `language` (str, default `english`): one of `english` / `japanese` /
+  `japanese_translate` / `french` / `spanish` / `dutch` / `chinese`
 
-`GET /events/{job_id}` — Server-Sent Events:
+Response: `{job_id, video_url, language}`.
+
+`GET /events/{job_id}` — Server-Sent Events stream:
+
 - `data: {"type":"progress","phase":"...","percent":N}`
 - `data: {"type":"log","message":"..."}`
-- `data: {"type":"done"}` → 続いて `event: result\ndata: {...}`
-- 失敗時: `data: {"type":"error","message":"..."}` および `event: error`
+- `data: {"type":"done"}` followed by `event: result\ndata: {...}`
+- on failure: `data: {"type":"error","message":"..."}` plus `event: error`
 
-`result` ペイロード:
+`result` payload:
 
 ```jsonc
 {
@@ -127,33 +161,61 @@ PC1–PC3        = numpy.linalg.svd(preds_centered) の上位 3 成分（z-score
     "excitement": [...], "valence": [...],
     "cognitive_load": [...], "novelty": [...]
   },
-  "pca": [[...], [...], [...]],   // 上位 3 PC、長さ n_segments
-  "pca_var": [0.73, 0.13, 0.08],  // 寄与率
+  "pca": [[...], [...], [...]],   // top 3 PCs, length n_segments
+  "pca_var": [0.73, 0.13, 0.08],  // explained variance ratios
   "thumbs": [{"t": 0.0, "url": "/static/thumbs/<job>/0000.jpg"}, ...],
-  "brain_urls": ["/static/brain/<job>/0000.png", ...],
-  "waveform": [0.0, 0.12, ...],   // 1500 ビンの正規化エンベロープ
+  "waveform": [0.0, 0.12, ...],   // 1500 normalised envelope bins
   "words": [{"t": 12.21, "d": 0.12, "text": "What"}, ...],
-  "elapsed_sec": 270.5
+  "mesh_url": "/static/mesh/fsaverage5.bin",
+  "preds_url": "/static/preds/<job>.bin",
+  "preds_dtype": "float16",
+  "preds_shape": [53, 20484],
+  "preds_normalized": true,
+  "elapsed_sec": 78.0
 }
 ```
 
-## 既知の制限
+`mesh_url` resolves to a custom packed binary (vertices / faces / sulcal
+map for both hemispheres) parsed by the WebGL viewer. `preds_url` is a
+flat `float16[T*V]` array, robust-normalised to `[0, 1]` so the client
+only has to threshold + look up the fire colormap.
 
-- セグメント数は動画長 ÷ TR(=1s) × kept_ratio。`predict()` 内のフィルタで一部落ちる。`times[i]` は実時刻
-- 軸スコアは z-score なのでクリップ間で絶対値比較に意味は無い
-- Yeo アトラスは `vol_to_surf(interpolation="nearest_most_frequent")` の MNI→fsaverage5 投影で若干の境界誤差。厳密な解析用途には FreeSurfer の `?h.Yeo2011_7Networks_N1000.annot` を直接使用推奨
-- `japanese_translate` モードは WhisperX の `--task translate` 単一パス。タイムスタンプは segment-level → 単語均等分割。原語の日本語 transcript は UI に出ない
-- TRIBEv2 自体は英語の自然刺激（映画/オーディオブック）で訓練されたモデル。非英語言語を `japanese` モード（そのまま）で投入すると、視覚・聴覚ネットワークは反応するが言語ネットワークの予測精度は明確に落ちる
+## Known limits
 
-## トラブルシュート
+- The number of kept segments is `video_duration ÷ TR(=1s) × kept_ratio`.
+  `predict()` internally drops a few; `times[i]` is the real-time anchor
+  and accounts for the gaps when plotting.
+- The axis scores are z-scored, so absolute comparisons across clips are
+  meaningless.
+- The Yeo atlas is projected to fsaverage5 with
+  `vol_to_surf(interpolation="nearest_most_frequent")`, so boundaries are
+  approximate. For rigorous analysis, prefer FreeSurfer's
+  `?h.Yeo2011_7Networks_N1000.annot` directly.
+- `japanese_translate` mode is a single WhisperX pass with
+  `--task translate`. Timestamps are segment-level and word offsets are
+  evenly distributed within each segment. The original Japanese
+  transcript is not surfaced in the UI.
+- TRIBEv2 was trained on English naturalistic stimuli (movies / audio
+  books). Feeding non-English audio in plain `japanese` mode (no
+  translation) keeps visual / auditory networks responsive, but
+  language-network predictions degrade noticeably.
 
-- `requests.exceptions.RequestException: timed out` — `build_atlas.py` は `urllib` で直接 DL する実装に切替済み、再実行で通る
-- ディスクが満杯 → `~/.cache/uv` (再生成可) を削除。HuggingFace の他モデルキャッシュは慎重に
-- ポート 8000 が衝突 → `python server.py` を編集するか `uvicorn server:app --port 9000`
-- WhisperX が `argument --align_model: expected one argument` で落ちる → `patches/apply.sh` 未適用。空文字を渡すバグの修正が当たっていない
+## Troubleshooting
 
-## ライセンス
+- `requests.exceptions.RequestException: timed out` while building the
+  atlas — `build_atlas.py` already falls back to a direct `urllib`
+  download; just re-run it.
+- Disk full → blow away `~/.cache/uv` (regenerated) first; be careful
+  with the rest of the HuggingFace cache.
+- Port 8000 in use → edit `server.py` or run
+  `uvicorn server:app --port 9000`.
+- WhisperX dies with `argument --align_model: expected one argument` →
+  `patches/apply.sh` was not applied. The empty-string fix lives in that
+  patch.
 
-このリポジトリのコードは MIT。`tribev2-src/` 以下と `patches/` の対象部分は
-`facebookresearch/tribev2` のライセンス（MIT）に従います。Yeo 2011 アトラスは
-[Yeo et al. 2011 J. Neurophysiol.](https://doi.org/10.1152/jn.00338.2011) のクレジット表示が必要です。
+## License
+
+The code in this repository is MIT. The contents of `tribev2-src/` and the
+patches in `patches/` follow the upstream MIT license of
+`facebookresearch/tribev2`. The Yeo 2011 atlas requires citation of
+[Yeo et al. 2011, J. Neurophysiol.](https://doi.org/10.1152/jn.00338.2011).
