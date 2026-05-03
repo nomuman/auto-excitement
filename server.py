@@ -94,6 +94,24 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     return np.zeros_like(x) if s < 1e-9 else (x - x.mean()) / s
 
 
+def _normalize_video(video_path: Path) -> Path:
+    """Re-encode HEVC/Dolby Vision/iPhone MOV to H.264+AAC MP4 so moviepy can read it."""
+    out = video_path.with_suffix(".norm.mp4")
+    cmd = [
+        state["ffmpeg"], "-loglevel", "error", "-y",
+        "-i", str(video_path),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-vf", "format=yuv420p",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    if out.exists() and out.stat().st_size > 0:
+        return out
+    return video_path
+
+
 def _patch_video_extractor_autocast() -> None:
     """Wrap neuralset's HuggingFace video extractor in CUDA fp16 autocast for ~1.5x speedup
     on V-JEPA2-ViT-g without changing model weights. Outputs auto-cast back to fp32."""
@@ -341,6 +359,12 @@ def _run_job(job_id: str, video_path: Path, language: str = "english") -> None:
         tee = StderrTee(job.q, sys.__stderr__)
         sys.stderr = tee
         try:
+            job.q.put({"type": "progress", "phase": "Normalizing video", "percent": 0})
+            norm_path = _normalize_video(video_path)
+            if norm_path != video_path:
+                video_path = norm_path
+            job.q.put({"type": "progress", "phase": "Normalizing video", "percent": 100})
+
             job.q.put({"type": "log", "message": f"Building events (lang={language}) ..."})
             df = state["model"].get_events_dataframe(video_path=str(video_path), language=language)
             job.q.put({"type": "log", "message": f"Events built: {len(df)} rows"})
@@ -365,7 +389,9 @@ def _run_job(job_id: str, video_path: Path, language: str = "english") -> None:
             job.q.put({"type": "done"})
         except Exception as e:
             log.exception("predict failed")
-            job.error = f"{type(e).__name__}: {e}"
+            import traceback
+            tb = traceback.format_exc()
+            job.error = f"{type(e).__name__}: {e}\n\n{tb}"
             job.q.put({"type": "error", "message": job.error})
         finally:
             sys.stderr = old_err
