@@ -1,9 +1,14 @@
 fastapi==0.136.1
+colorcet==3.2.1
 nibabel==5.4.2
 nilearn==0.13.1
 numpy==2.2.6
 pandas==3.0.2
 python-multipart==0.0.27
+pyvista==0.48.0
 requests==2.33.1
+scikit-image==0.26.0
+seaborn==0.13.2
 torch==2.11.0
 uvicorn==0.46.0
+vtk==9.6.1
