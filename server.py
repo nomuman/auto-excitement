@@ -406,7 +406,8 @@ async def predict(video: UploadFile = File(...), language: str = Form("english")
         raise HTTPException(400, f"language must be one of {SUPPORTED_LANGUAGES}")
     suffix = Path(video.filename).suffix or ".mp4"
     job_id = uuid.uuid4().hex
-    saved = STATIC / "videos" / f"{job_id}{suffix}"
+    # Use a fixed filename per user session so neuralset/exca cache hits on re-upload
+    saved = STATIC / "videos" / f"latest_upload{suffix}"
     with saved.open("wb") as f:
         shutil.copyfileobj(video.file, f)
     log.info(f"saved upload -> {saved} ({saved.stat().st_size} bytes), lang={language}")
